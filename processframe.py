@@ -64,6 +64,21 @@ class FrameProcessor:
         self.fff.load_state_dict(new_state_dict)
         self.fff.eval()
 
+        # 初始化cebra model数据成员
+        self.model = CEBRA(
+            model_architecture="offset5-model", #consider: "offset10-model-mse" if Euclidean
+            batch_size=20,
+            learning_rate=3e-5,
+            temperature=1.12,
+            max_iterations=2000, #we will sweep later; start with default
+            conditional='time', #for supervised, put 'time_delta', or 'delta'
+            output_dimension=3,
+            distance='cosine', #consider 'euclidean'; if you set this, output_dimension min=2
+            device="cuda:0",
+            verbose=True,
+            time_offsets=5
+        )
+
         # 初始化 CUDA context
         cuda.init()
         self.cfx = cuda.Device(device_id).make_context()
@@ -72,21 +87,6 @@ class FrameProcessor:
         if self.engine is None:
             print("加载引擎失败。")
         self.cfx.pop()
-        
-        # 初始化cebra model数据成员
-        self.model = CEBRA(
-            model_architecture="offset10-model", #consider: "offset10-model-mse" if Euclidean
-            batch_size=512,
-            learning_rate=3e-4,
-            temperature=1.12,
-            max_iterations=5000, #we will sweep later; start with default
-            conditional='time', #for supervised, put 'time_delta', or 'delta'
-            output_dimension=3,
-            distance='cosine', #consider 'euclidean'; if you set this, output_dimension min=2
-            device="cuda_if_available",
-            verbose=True,
-            time_offsets=10
-        )
 
         # 其他参数
         self.Params_post = params_post
@@ -102,6 +102,8 @@ class FrameProcessor:
         self.cfx.push()
         video_adjust = self.test_batch_tensorrt(self.engine, video_raw, template, batch_size, overlap_size)
         video_adjust_copy = video_adjust.copy()
+        self.cfx.pop()
+        torch.cuda.empty_cache()
 
         # Rapid segmentation
         Masks = self.seg_batch(video_adjust_copy, self.fff, self.p, self.Params_post, 20)
@@ -114,11 +116,11 @@ class FrameProcessor:
         # input: traces (N*T)
         # output: embeddings (3*T)
         # training slowly
-        self.model = self.model.fit(traces)
+        # 转置 traces 使其形状从 (N, T) 变为 (T, N)
+        traces_TN = np.swapaxes(traces, 0, 1)
+        self.model.fit(traces_TN)
 
-        self.cfx.pop()
-
-        return video_adjust, template, Masks, traces
+        return video_adjust, template, Masks, traces_TN
 
     def process_frames_online(self, video_raw, template, batch_size, overlap_size, Masks):
         # Preprocessing
@@ -129,6 +131,8 @@ class FrameProcessor:
         self.cfx.push()
         video_adjust = self.test_online_tensorrt(self.engine, video_raw, template, batch_size, overlap_size)
         video_adjust_copy = video_adjust.copy()
+        self.cfx.pop()
+        torch.cuda.empty_cache()
 
         # extract traces
         traces = self.extrace_trace(Masks, video_adjust, frame_start=0)
@@ -137,9 +141,10 @@ class FrameProcessor:
         # input: traces (N*t=8)
         # output: embeddings (3*t=8)
         # transform  rapidly
-        embeddings = self.model.transform(traces)
+        traces_TN = np.swapaxes(traces, 0, 1)
+        embeddings = self.model.transform(traces_TN)
 
-        return video_adjust_copy, traces, embeddings
+        return video_adjust_copy, traces_TN, embeddings
 
     def extrace_trace(self, Masks, prob_map, frame_start=0):
         N = len(Masks) # component number
@@ -270,7 +275,7 @@ class FrameProcessor:
             image[t,0] = img_rigid
 
         # 分配缓冲区
-        output_data = np.empty([1, 1, batch_size + 2 * overlap_size, 512, 512], dtype=np.float32)
+        output_data = np.empty([1, 1, timepoints, 512, 512], dtype=np.float32)
         input_data = np.concatenate((image, template), axis=0)
 
         # 分配CUDA内存
@@ -293,7 +298,7 @@ class FrameProcessor:
         data_fisrt = data_fisrt.reshape(batchsize * timepoints, c, h, w)
 
         # 分配缓冲区
-        output_data = np.empty([1 , 1, batch_size + 2 * overlap_size, 512, 512], dtype=np.float32)
+        output_data = np.empty([1 , 1, timepoints, 512, 512], dtype=np.float32)
         input_data = np.concatenate((image, template), axis=0)  
         # 分配CUDA内存
         d_input = cuda.mem_alloc(input_data.nbytes)
